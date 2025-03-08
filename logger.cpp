@@ -6,258 +6,190 @@
 #include <chrono>
 #include <sstream>
 #include <filesystem>
-#include <zlib.h> // For compression
+#include <queue>
+#include <condition_variable>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <filesystem>
 
-#include <fcntl.h> // Include this at the top for fsync()
 namespace fs = std::filesystem;
-
 using namespace std;
 
-#define BUFFER_SIZE 1024         // Must be a power of 2
-#define MAX_LOG_SIZE 1024 * 1024 // 1MB max log file size
-#define MAX_LOG_FILES 5          // Keep last 5 log files
-#define BATCH_SIZE 10            // Number of logs per network batch
+#define MAX_LOG_SIZE 1024 * 1024  // 1MB max log file size
+#define MAX_LOG_FILES 5           // Keep last 5 log files
+#define BATCH_SIZE 100            // Number of logs per batch (disk/network)
+#define BUFFER_SIZE 1024          // Ring buffer size
 
-class Logger
-{
+class Logger {
 public:
-    enum Level
-    {
-        INFO,
-        DEBUG,
-        ERROR
-    };
-    enum LogFormat
-    {
-        PLAIN_TEXT,
-        JSON
-    };
+    enum Level { INFO, DEBUG, ERROR };
+    enum LogFormat { PLAIN_TEXT, JSON };
 
-    Logger(const string &filename, Level minLogLevel = INFO, LogFormat format = PLAIN_TEXT, bool networkLogging = false, string serverIp = "127.0.0.1", int serverPort = 5000)
-        : baseFilename(filename), stopLogging(false), head(0), tail(0), currentLogSize(0), minLevel(minLogLevel), logFormat(format), enableNetworkLogging(networkLogging), serverIP(serverIp), serverPort(serverPort)
+    Logger(const string &filename, Level minLogLevel = INFO, LogFormat format = PLAIN_TEXT, 
+           bool networkLogging = false, string serverIp = "127.0.0.1", int serverPort = 5000)
+        : baseFilename(filename), stopLogging(false), minLevel(minLogLevel), logFormat(format), 
+          enableNetworkLogging(networkLogging), serverIP(serverIp), serverPort(serverPort),
+          head(0), tail(0), currentLogSize(0) 
     {
         rotateLogs();
         logFile.open(baseFilename, ios::out | ios::app);
-        if (!logFile.is_open())
-        {
-            cerr << "Error: Failed to open log file: " << baseFilename << endl;
-        }
+        if (!logFile.is_open()) cerr << "Error: Failed to open log file: " << baseFilename << endl;
 
         workerThread = thread(&Logger::processLogs, this);
-        if (enableNetworkLogging)
-        {
-            networkThread = thread(&Logger::sendLogsToServer, this);
-        }
+        if (enableNetworkLogging) networkThread = thread(&Logger::sendLogsToServer, this);
+
+        cout << "Logger initialized. Writing logs to: " << baseFilename << endl;
     }
 
-    ~Logger()
-    {
+    ~Logger() {
         stopLogging = true;
-        if (workerThread.joinable())
-        {
-            workerThread.join();
-        }
-        if (networkThread.joinable())
-        {
-            networkThread.join();
-        }
-        if (logFile.is_open())
-        {
-            cout << "Closing log file" << endl; // Debugging output
-            logFile.flush();
-            logFile.close();
-        }
+        cv.notify_all();
+        if (workerThread.joinable()) workerThread.join();
+        if (networkThread.joinable()) networkThread.join();
+        if (logFile.is_open()) logFile.close();
+        cout << "Logger shutting down." << endl;
     }
 
-    void log(Level level, const string &message)
-    {
-        if (level < minLevel)
-            return; // Log filtering
+    void log(Level level, const string &message) {
+        if (level < minLevel) return; // Log filtering
 
-        stringstream logEntry;
-        logEntry << formatLog(level, message);
+        string formattedLog = formatLog(level, message);
 
-        size_t next = (head.load(memory_order_relaxed) + 1) % BUFFER_SIZE;
-        if (next == tail.load(memory_order_acquire))
         {
-            cerr << "Buffer full, dropping log: " << logEntry.str() << endl;
-            return; // Drop log if buffer is full
+            unique_lock<mutex> lock(bufferMutex);
+            if ((head + 1) % BUFFER_SIZE == tail) {
+                cerr << "Buffer full, dropping log: " << formattedLog << endl;
+                return; // Buffer full, drop log
+            }
+            buffer[head] = formattedLog;
+            head = (head + 1) % BUFFER_SIZE;
         }
 
-        buffer[head.load(memory_order_relaxed)] = logEntry.str();
-        head.store(next, memory_order_release);
-
-        cout << "Writing to log.txt: " << logEntry.str() << endl;
-
-        // Write log entry to the file
-        logFile << logEntry.str() << endl;
-        logFile.flush(); // Ensure C++ stream flushes
-
-        // Force OS to write the data immediately to disk
-        int fd = open(baseFilename.c_str(), O_WRONLY | O_APPEND);
-        if (fd != -1)
-        {
-            fsync(fd); // Force sync to disk
-            close(fd);
-        }
+        cout << "Log added to buffer: " << formattedLog << endl;
+        cv.notify_one(); // Wake up consumer thread
     }
 
 private:
     string baseFilename;
     ofstream logFile;
-    vector<string> buffer{BUFFER_SIZE};
-    atomic<size_t> head, tail;
-    thread workerThread, networkThread;
     atomic<bool> stopLogging;
-    atomic<size_t> currentLogSize;
     Level minLevel;
     LogFormat logFormat;
     bool enableNetworkLogging;
     string serverIP;
     int serverPort;
+    atomic<size_t> currentLogSize;
 
-    void processLogs()
-    {
-        cout << "ProcessLogs thread started" << endl; // Debugging message
+    string buffer[BUFFER_SIZE];
+    atomic<size_t> head, tail;
+    mutex bufferMutex;
+    condition_variable cv;
 
-        while (!stopLogging || head.load(memory_order_acquire) != tail.load(memory_order_acquire))
-        {
-            if (head.load(memory_order_acquire) == tail.load(memory_order_acquire))
-            {
-                this_thread::yield();
-                continue;
+    thread workerThread, networkThread;
+
+    void processLogs() {
+        vector<string> batch;
+        cout << "Log processing thread started." << endl;
+
+        while (!stopLogging || head != tail) {
+            unique_lock<mutex> lock(bufferMutex);
+            cv.wait(lock, [this] { return head != tail || stopLogging; });
+
+            while (head != tail && batch.size() < BATCH_SIZE) {
+                batch.push_back(buffer[tail]);
+                tail = (tail + 1) % BUFFER_SIZE;
+            }
+            lock.unlock();
+
+            if (!batch.empty()) {
+                cout << "Processing " << batch.size() << " logs..." << endl;
+                for (const string &log : batch) {
+                    logFile << log << endl;
+                    cout << "Written to file: " << log << endl;
+                    currentLogSize += log.size();
+                }
+                logFile.flush();
+                batch.clear();
             }
 
-            size_t index = tail.load(memory_order_relaxed);
-            string logMessage = buffer[index];
-            tail.store((index + 1) % BUFFER_SIZE, memory_order_release);
-
-            cout << "Processing log: " << logMessage << endl;
-            logFile << logMessage << endl;
-            logFile.flush();
-
-            // Force immediate write to disk
-            int fd = open(baseFilename.c_str(), O_WRONLY | O_APPEND);
-            if (fd != -1)
-            {
-                fsync(fd);
-                close(fd);
-            }
+            if (currentLogSize >= MAX_LOG_SIZE) rotateLogs();
         }
     }
 
-    void sendLogsToServer()
-    {
+    void sendLogsToServer() {
+        cout << "Network logging enabled. Connecting to server: " << serverIP << ":" << serverPort << endl;
         int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0)
+        if (sock < 0) {
+            cerr << "Failed to create socket." << endl;
             return;
+        }
 
         struct sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
         serverAddr.sin_port = htons(serverPort);
         inet_pton(AF_INET, serverIP.c_str(), &serverAddr.sin_addr);
 
-        if (connect(sock, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
-        {
+        if (connect(sock, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0) {
+            cerr << "Failed to connect to server." << endl;
             close(sock);
             return;
         }
 
         vector<string> batch;
-        while (!stopLogging || head.load(memory_order_acquire) != tail.load(memory_order_acquire))
-        {
-            if (head.load(memory_order_acquire) == tail.load(memory_order_acquire))
-            {
-                this_thread::yield();
-                continue;
+        while (!stopLogging || head != tail) {
+            unique_lock<mutex> lock(bufferMutex);
+            cv.wait(lock, [this] { return head != tail || stopLogging; });
+
+            while (head != tail && batch.size() < BATCH_SIZE) {
+                batch.push_back(buffer[tail]);
+                tail = (tail + 1) % BUFFER_SIZE;
             }
+            lock.unlock();
 
-            size_t index = tail.load(memory_order_relaxed);
-            batch.push_back(buffer[index]);
-            tail.store((index + 1) % BUFFER_SIZE, memory_order_release);
-
-            if (batch.size() >= BATCH_SIZE)
-            {
+            if (!batch.empty()) {
                 string batchMessage;
-                for (const auto &log : batch)
-                {
-                    batchMessage += log + "\n";
-                }
+                for (const auto &log : batch) batchMessage += log + "\n";
                 send(sock, batchMessage.c_str(), batchMessage.size(), 0);
+                cout << "Sent " << batch.size() << " logs to server." << endl;
                 batch.clear();
             }
-        }
-        if (!batch.empty())
-        {
-            string batchMessage;
-            for (const auto &log : batch)
-            {
-                batchMessage += log + "\n";
-            }
-            send(sock, batchMessage.c_str(), batchMessage.size(), 0);
         }
         close(sock);
     }
 
-    void rotateLogs()
-    {
-        if (logFile.is_open())
-        {
-            logFile.close();
-        }
+    void rotateLogs() {
+        if (logFile.is_open()) logFile.close();
+        cout << "Rotating logs..." << endl;
 
-        // Rotate old log files (log_4.txt -> log_5.txt, log_3.txt -> log_4.txt, ...)
-        for (int i = MAX_LOG_FILES - 1; i > 0; --i)
-        {
+        for (int i = MAX_LOG_FILES - 1; i > 0; --i) {
             string oldName = "log_" + to_string(i) + ".txt";
             string newName = "log_" + to_string(i + 1) + ".txt";
-            if (fs::exists(oldName))
-            {
+            if (fs::exists(oldName)) {
                 fs::rename(oldName, newName);
+                cout << "Renamed " << oldName << " to " << newName << endl;
             }
         }
 
-        // Rename the current log file to log_1.txt
-        if (fs::exists(baseFilename))
-        {
+        if (fs::exists(baseFilename)) {
             fs::rename(baseFilename, "log_1.txt");
+            cout << "Renamed " << baseFilename << " to log_1.txt" << endl;
         }
 
-        // Create a new empty log file (log.txt)
         logFile.open(baseFilename, ios::out | ios::trunc);
-        if (!logFile.is_open())
-        {
-            cerr << "Error: Failed to create new log file: " << baseFilename << endl;
-        }
+        if (!logFile.is_open()) cerr << "Error: Failed to create new log file: " << baseFilename << endl;
 
         currentLogSize = 0;
+        cout << "Log rotation complete." << endl;
     }
 
-    string formatLog(Level level, const string &message)
-    {
+    string formatLog(Level level, const string &message) {
         stringstream logEntry;
-        if (logFormat == JSON)
-        {
-            logEntry << "{"
-                     << "\"timestamp\": \"" << getTimestamp() << "\", "
-                     << "\"level\": \"" << levelToString(level) << "\", "
-                     << "\"message\": \"" << message << "\""
-                     << "}";
-        }
-        else
-        {
-            logEntry << getTimestamp() << " [" << levelToString(level) << "] " << message << "\n";
-        }
+        logEntry << getTimestamp() << " [" << levelToString(level) << "] " << message;
         return logEntry.str();
     }
 
-    string getTimestamp()
-    {
+    string getTimestamp() {
         auto now = chrono::system_clock::now();
         auto timeT = chrono::system_clock::to_time_t(now);
         stringstream ss;
@@ -265,30 +197,23 @@ private:
         return ss.str();
     }
 
-    string levelToString(Level level)
-    {
-        switch (level)
-        {
-        case INFO:
-            return "INFO";
-        case DEBUG:
-            return "DEBUG";
-        case ERROR:
-            return "ERROR";
-        default:
-            return "UNKNOWN";
+    string levelToString(Level level) {
+        switch (level) {
+            case INFO: return "INFO";
+            case DEBUG: return "DEBUG";
+            case ERROR: return "ERROR";
+            default: return "UNKNOWN";
         }
     }
 };
 
-int main()
-{
-    Logger logger("logs.txt", Logger::DEBUG, Logger::JSON, true, "127.0.0.1", 5000);
+int main() {
+    Logger logger("log.txt", Logger::DEBUG, Logger::PLAIN_TEXT, true, "127.0.0.1", 5000);
 
     logger.log(Logger::INFO, "This is an info message.");
     logger.log(Logger::DEBUG, "Debugging application.");
     logger.log(Logger::ERROR, "An error occurred!");
 
-    this_thread::sleep_for(chrono::seconds(2)); // Ensure logs are written
+    this_thread::sleep_for(chrono::seconds(2));
     return 0;
 }
